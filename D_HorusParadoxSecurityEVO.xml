@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <specVersion>
+    <major>1</major>
+    <minor>0</minor>
+  </specVersion>
+  <device>
+    <deviceType>urn:demo-horus-paradox-com:device:alarm:1</deviceType>
+    <staticJson>D_HorusParadoxPanel.json</staticJson> 
+    <friendlyName>Paradox Alarm EVO</friendlyName>
+    <manufacturer>Sectron</manufacturer>
+    <manufacturerURL>http://www.sectron.com/</manufacturerURL>
+    <modelDescription>Paradox Digiplex EVO Alarm panel</modelDescription>
+    <modelName>Digiplex EVO</modelName>
+    <modelNumber>1.0</modelNumber>
+    <modelURL>https://www.horus-sc.com/horusparadoxalarmaevo/</modelURL>
+    <protocol>cr</protocol>
+    <handleChildren>1</handleChildren>
+    <UDN>uuid:Upnp-HorusParadoxDigiplexEVO-1_0-1234567890001</UDN>
+    <UPC>123456789</UPC>
+    <serviceList>
+    </serviceList>
+    <implementationList>
+      <implementationFile>I_HorusParadoxSecurityEVO.xml</implementationFile>
+    </implementationList>
+    <presentationURL>htttp://www.sectron.com</presentationURL>
+  </device>
+</root>

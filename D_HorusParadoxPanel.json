@@ -1,0 +1,34 @@
+{
+	"default_icon": "keypad.png",
+	"state_icons": [],
+	"x": "4",
+	"y": "4",
+	"inScene": "1",
+	"ToggleButton": 1,
+	"Tabs": [
+		{
+			"Label": {
+				"lang_tag": "ui7_advanced",
+				"text": "Advanced"
+			},
+			"Position": "0",
+			"TabType": "javascript",
+			"ScriptName": "shared.js",
+			"Function": "advanced_device"
+		}
+	],
+	"sceneList": {
+		"group_1": {
+			"cmd_1": {
+				"label": "OFF",
+				"serviceId": "",
+				"action": "SetModeTarget",
+				"arguments": {
+					"NewModeTarget": "Off"
+				}
+			}
+		}
+	},
+	"eventList2": [],
+	"device_type": "urn:demo-horus-paradox-com:device:alarm:1"
+}

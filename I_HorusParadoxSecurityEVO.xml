@@ -1,0 +1,1924 @@
+<?xml version="1.0"?>
+<implementation>
+    <settings>
+        <protocol>cr</protocol>
+    </settings>
+    <functions>
+        -- TODO: Remove the duplicate blocks of code, particularly in IO
+        -- TODO: Move the if-then logic and make table-driven
+        -- TODO: Move Stay/Instant and Arm/Force to flag when requested, not enacted
+
+        local MAX_RETRY = 4
+        local DEBUG_MODE = false
+        local ALARM_SERVICEID = "urn:demo-horus-paradox-com:serviceId:ParadoxSecurityEVO1"
+        local ALARM_PARTITION_SERVICEID = "urn:micasaverde-com:serviceId:AlarmPartition1"
+        local ALARM_PARTITION_SERVICEID2 = "urn:micasaverde-com:serviceId:AlarmPartition2"
+        local SECURITY_SENSOR_SERVICEID = "urn:micasaverde-com:serviceId:SecuritySensor1"
+        local HADEVICE_SERVICEID = "urn:micasaverde-com:serviceId:HaDevice1"
+
+        local ENABLE_REMOTE_ARM = false
+        local ENABLE_REMOTE_DISARM = false
+        local ENABLE_REMOTE_PANIC = false
+
+
+        local taskHandle = -1
+
+        local TASK_ERROR = 2
+        local TASK_ERROR_PERM = -2
+        local TASK_SUCCESS = 4
+        local TASK_BUSY = 1
+
+        local function log(text)
+            luup.log("ParadoxSecurity: " .. text)
+        end
+
+        local function debug(text)
+            if (DEBUG_MODE == true) then
+                log(text)
+            end
+        end
+
+        local function task(text, mode)
+            luup.log("task " .. text)
+            if (mode == TASK_ERROR_PERM) then
+                taskHandle = luup.task(text, TASK_ERROR, "ParadoxAlarmPanel", taskHandle)
+            else
+                taskHandle = luup.task(text, mode, "ParadoxAlarmPanel", taskHandle)
+
+                -- Clear the previous error, since they're all transient
+                if (mode ~= TASK_SUCCESS) then
+                    luup.call_delay("clearTask", 30, "", false)
+                end
+            end
+        end
+
+        function clearTask()
+            task("Clearing...", TASK_SUCCESS)
+        end
+
+        --- Initialize the Alarm Panel Variables/Config parameters
+        --
+        -- Read, or setup the Default values, for the following Alarm Panel configuration Parameters:
+        --     maxAlarmZones - (number, default 24)
+        --     maxAlarmPartitions - (number, default 1)
+        --     maxUserCodes - (number, default 5)
+        --     enableVirtualInputs - (boolean, default false)
+        --     maxVirtualInputs - (number, default 5, if enableVirtualInputs is set)
+        --
+        -- These config parameters are intended to speed the Alarm Panel initialization process, by "limiting"
+        -- how much data must be read from the Alarm Panel during startup.
+        --
+        function initializeParameters(deviceId)
+            --
+            -- Set default values for maxAlarmZones (24), maxAlarmPartitions (1) and maxUserCodes (5).  Only "set" these if they
+            -- aren't already set to force these Variables to appear in Vera's Device list.
+            --
+            
+            FULL_DATA = luup.variable_get(ALARM_SERVICEID, "fullData", deviceId)
+            
+            MAX_ALARM_ZONES = luup.variable_get(ALARM_SERVICEID, "maxAlarmZones", deviceId)
+            if (MAX_ALARM_ZONES == nil) then
+                MAX_ALARM_ZONES = 24
+                luup.variable_set(ALARM_SERVICEID, "maxAlarmZones", tostring(MAX_ALARM_ZONES), deviceId)
+            else
+                MAX_ALARM_ZONES = tonumber(MAX_ALARM_ZONES)
+                if ((MAX_ALARM_ZONES == nil) or (MAX_ALARM_ZONES &lt;= 0)) then
+                    return false, "maxAlarmZones Parameter must be a number, greater than 0", "ParadoxAlarmPanel"
+                end
+            end
+
+            MAX_ALARM_PARTITIONS = luup.variable_get(ALARM_SERVICEID, "maxAlarmPartitions", deviceId)
+            if (MAX_ALARM_PARTITIONS == nil) then
+                MAX_ALARM_PARTITIONS = 1
+                luup.variable_set(ALARM_SERVICEID, "maxAlarmPartitions", tostring(MAX_ALARM_PARTITIONS), deviceId)
+            else
+                MAX_ALARM_PARTITIONS = tonumber(MAX_ALARM_PARTITIONS)
+                if ((MAX_ALARM_PARTITIONS == nil) or (MAX_ALARM_PARTITIONS &lt;=0)) then
+                    return false, "maxAlarmPartitions Parameter must be a number, greater than 0", "ParadoxAlarmPanel"
+                end
+            end
+
+            MAX_USER_CODES = luup.variable_get(ALARM_SERVICEID, "maxUserCodes", deviceId)
+            if (MAX_USER_CODES == nil) then
+                MAX_USER_CODES = 5
+                luup.variable_set(ALARM_SERVICEID, "maxUserCodes", tostring(MAX_USER_CODES), deviceId)
+            else
+                MAX_USER_CODES = tonumber(MAX_USER_CODES)
+                if ((MAX_USER_CODES == nil) or (MAX_USER_CODES &lt;=0)) then
+                    return false, "maxAlarmCodes Parameter must be a number, greater than 0", "ParadoxAlarmPanel"
+                end
+            end
+
+            local enableRemoteArming = luup.variable_get(ALARM_SERVICEID, "Remote Arm (Yes / No)", deviceId)
+            if (enableRemoteArming  == nil) then
+                ENABLE_REMOTE_ARM = true
+                ENABLE_REMOTE_DISARM = true
+                luup.variable_set(ALARM_SERVICEID, "Remote Arm (Yes / No)", "Yes", deviceId)
+            elseif (enableRemoteArming  == "Yes") then
+                ENABLE_REMOTE_ARM = true
+                ENABLE_REMOTE_DISARM = true
+            elseif (enableRemoteArming == "No") then
+                ENABLE_REMOTE_ARM = false
+                ENABLE_REMOTE_DISARM = false
+            else
+                return false, "enableRemoteArm Parameter must be either blank, false or a value from the wiki...", "ParadoxAlarmPanel"
+            end
+
+            local enableRemotePanic = luup.variable_get(ALARM_SERVICEID, "Remote Panic (Yes / No)", deviceId)
+            if (enableRemotePanic == nil) then
+                ENABLE_REMOTE_PANIC = true
+                luup.variable_set(ALARM_SERVICEID, "Remote Panix (Yes / No)", "Yes", deviceId)
+            elseif (enableRemotePanic == "Yes") then
+                ENABLE_REMOTE_PANIC = true
+            elseif (enableRemotePanic == "No") then
+                ENABLE_REMOTE_PANIC = false
+            else
+                return false, "enableRemotePanic Parameter must be either blank, false or a value from the wiki...", "ParadoxAlarmPanel"
+            end
+
+            ENABLE_VIRTUAL_INPUTS = luup.variable_get(ALARM_SERVICEID, "Virtual Input (Yes / No)", deviceId)
+            if (ENABLE_VIRTUAL_INPUTS  == nil) then
+                ENABLE_VIRTUAL_INPUTS = false
+                luup.variable_set(ALARM_SERVICEID, "Virtual Input (Yes / No)", "No", deviceId)
+            else
+                if (ENABLE_VIRTUAL_INPUTS == "Yes") then
+                    ENABLE_VIRTUAL_INPUTS = true
+                elseif (ENABLE_VIRTUAL_INPUTS == "No") then
+                    ENABLE_VIRTUAL_INPUTS = false
+                else
+                    return false, "enableVirtualInputs Parameter must be either true or false", "ParadoxAlarmPanel"
+                end
+            end
+
+            if (ENABLE_VIRTUAL_INPUTS) then
+                MAX_VIRTUAL_INPUTS = luup.variable_get(ALARM_SERVICEID, "Numero de Entradas Virtuales", deviceId)
+                if (MAX_VIRTUAL_INPUTS == nil) then
+                    MAX_VIRTUAL_INPUTS = 3
+                    luup.variable_set(ALARM_SERVICEID, "Numero de Entradas Virtuales", tostring(MAX_VIRTUAL_INPUTS), deviceId)
+                else
+                    MAX_VIRTUAL_INPUTS = tonumber(MAX_VIRTUAL_INPUTS)
+                    if ((MAX_VIRTUAL_INPUTS == nil) or (MAX_VIRTUAL_INPUTS &lt;=0)) then
+                        return false, "maxVirtualInputs Parameter must be a number, greater than 0", "ParadoxAlarmPanel"
+                    end
+                end
+            end
+
+            return true, "Ok", "Horus Paradox Panel de Alarma"
+        end
+
+
+        --- Initialize "Area" Labels from the Alarm panel.
+        --
+        -- This function will initialize all the labels for the Alarm Panel.  An
+        -- "Area" is equivalent to a "Partition" in some alarm systems, it permits
+        -- you to have one alarm panel control different entities (like a Freestanding Toolshed)
+        -- Most houses likely have one or two Areas, and it's the thing that gets armed.
+        --
+        -- Depending upon the Alarm model, you'll have different numbers of Areas in your System.
+        --
+        -- For each area, a Child Devices will be created:
+        --     Alarm n
+        --
+        -- Each of these Devices is listed as a Alarm Partition Device.  This device has Scene-aware "states" for:
+        --     Armed - Away Armed for Force Away Armed
+        --     StayArmed - Stay Armed or Instant Armed
+        --     Disarmed - Alarm is Disarmed (not Armed, and not StayArmed)
+        --     Breach - The House Alarm is going off
+        --
+        -- The code in this Alarm interface may not have captured all of the Alarm states.
+        -- Please validate within your own system to ensure it works in your specific cases.
+        --
+        function initializeAreaLabels(deviceId, childDevices)
+            AREA_LABEL = {}
+            AREA_LABEL["000"] = "Occurs in all areas enabled in the system"
+            AREA_LABEL["255"] = "Occurs in at least one area enabled in the system"
+
+            local areaLabel
+            local areaString
+            local areaLabelRequest
+            local retryCount
+            
+            luup.io.intercept()
+            for area = 1, MAX_ALARM_PARTITIONS do
+                areaString = string.format("%03u", area)
+                areaLabelRequest = "AL" .. areaString
+
+                log("About to request " .. areaLabelRequest)
+                if luup.io.write(areaLabelRequest) == false then
+                   debug("Cannot send Request-Area-Label, communications error - " .. areaLabelRequest .. " check serial port")
+                   luup.set_failure(true)
+                   return false, "Cannot send Request-Area-Label, communications error - " .. areaLabelRequest, "ParadoxAlarmPanel"
+                end
+
+                --
+                -- We might get async responses from other things before our
+                -- response, and we need to "skip over" these.
+                --
+                -- This can happen if a Door, Window or Motion sensor "trips" during
+                -- our initialization processes... and it does happen...
+                --
+                retryCount = 1
+                repeat
+                    areaLabel = luup.io.read()
+                    if (areaLabel == nil) then
+                        debug("Failure in Request-Area-Label Response, communications error " .. areaLabelRequest)
+                        luup.set_failure(true)
+                        return false, "Failure in Request-Area-Label Response, communications error " .. areaLabelRequest, "ParadoxAlarmPanel"
+                    end
+
+                    -- Check to see if the data we got back aligns with the Command we
+                    -- just sent.  The Paradox Alarm panel will send back a response with
+                    -- the command "repeated" at the beginning.
+                    --
+                    if (string.find(areaLabel, areaLabelRequest, 1, true) ~= nil) then
+                        break
+                    else
+                        -- TODO: Make our standard handler handle these.
+                    end
+
+                    retryCount = retryCount + 1
+                until (retryCount &gt; MAX_RETRY)
+
+                --
+                -- If we hit a failure of this form when making Area Label requests, it represents
+                -- that we've hit the end of the Zones for this Alarm Panel (since it may have 4 or 8 areas)
+                if (string.find(areaLabel, "&amp;fail")) then
+                    debug("Request-Area-Label Response, fail response " .. areaLabelRequest .. "-" .. areaLabel)
+                    return true, "Ok", "ParadoxAlarmPanel"
+                end
+
+                --
+                -- Store it in the Global list of areas
+                -- Index it using the "formatted" code so it's easier to find later on.  Note that the first "5"
+                -- characters of the areaLabel are the same as the first 5 characters in the command
+                -- that were sent, and there are trailing space, so we need to trim both.
+                --
+                areaLabel = string.gsub(string.sub(areaLabel, 6), "%s+$", "")
+                log("Storing " .. areaString .. "-" .. areaLabel)
+                AREA_LABEL[areaString] = areaLabel
+
+                luup.chdev.append(deviceId, childDevices,
+                    "Area-" .. areaString, "Alarm " .. areaLabel,
+                    "urn:schemas-micasaverde-com:device:AlarmPartition:2", "D_HorusParadoxAlarmPartition2.xml",
+                    "", "", false)
+            end
+            
+            luup.set_failure(false)
+            return true, "Ok", "ParadoxAlarmPanel"
+        end
+
+        --- Initialize "User" Labels from the Alarm panel.
+        --
+        -- This function will initialize all the labels for the various Users of the Alarm.
+        --
+        -- Depending upon the Paradox Alarm model, you'll have support for varying numbers
+        -- of users.  This routine loads all Users for future logging capabilities.
+        --
+        function initializeUserLabels(deviceId, childDevices)
+            USER_LABEL = {}
+            USER_LABEL["000"] = "All Users/One touch Bypass"
+
+            local userLabel
+            local userString
+            local userLabelRequest
+            local retryCount
+
+            luup.io.intercept()
+            for user = 1, MAX_USER_CODES do
+                userString = string.format("%03u", user)
+                userLabelRequest = "UL" .. userString
+
+                log("About to request " .. userLabelRequest)
+                if luup.io.write(userLabelRequest) == false then
+                    debug("Cannot send Request-User-Label, communications error - " .. areaLabelRequest .. " Check serial port")
+                    luup.set_failure(true)
+                    return false, "Cannot send Request-User-Label, communications error - " .. userLabelRequest, "ParadoxAlarmPanel"
+                end
+
+                retryCount = 1
+                repeat
+                    userLabel = luup.io.read()
+                    if (userLabel == nil) then
+                        debug("Failure in Request-User-Label Response, communications error " .. userLabelRequest)
+                        luup.set_failure(true)
+                        return false, "Failure in Request-User-Label Response, communications error " .. userLabelRequest, "ParadoxAlarmPanel"
+                    end
+
+                    -- Check to see if the data we got back aligns with the Command we
+                    -- just sent.  The Paradox Alarm panel will send back a response with
+                    -- the command "repeated" at the beginning.
+                    --
+                    if (string.find(userLabel, userLabelRequest, 1, true) ~= nil) then
+                        break
+                    else
+                        -- TODO: Make our standard handler handle these.
+                    end
+
+                    retryCount = retryCount + 1
+                until (retryCount &gt; MAX_RETRY)
+
+                --
+                -- If we hit a failure of this form when making user Label requests, it represents
+                -- that we've hit the end of the Zones for this Alarm Panel (since it may have 4 or 8 users)
+                if (string.find(userLabel, "&amp;fail")) then
+                    debug("Request-user-Label Response, fail response " .. userLabelRequest .. "-" .. userLabel)
+                    return
+                end
+
+                --
+                -- Store it in the Global list of users
+                -- Index it using the "formatted" code so it's easier to find later on.  Note that the first "5"
+                -- characters of the userLabel are the same as the first 5 characters in the command
+                -- that were sent, and there are trailing space, so we need to trim both.
+                --
+                userLabel = string.gsub(string.sub(userLabel, 6), "%s+$", "")
+                log("Storing " .. userString .. "-" .. userLabel)
+                USER_LABEL[userString] = userLabel
+            end
+
+            return true, "Ok", "ParadoxAlarmPanel"
+        end
+
+        --- Initialize "Zone" Labels from the Alarm panel.
+        --
+        -- This function will initialize all the Zone labels for the Alarm Panel.  A
+        -- "Zone" typically represents a Door, Window or Motion Sensor that is attached
+        -- to the Alarm control panel.  Different Alarm models in the range support different
+        -- numbers of Zones, so these are discovered on the fly during Startup.
+        --
+        -- Each Zone is registered as a UPnP Motion Sensor Device.
+        --
+        -- These will be set to "Tripped" when the Zone detects a Window, Door or Motion Sensor
+        -- event in that Zone.  Similarly, they will be cleared when the Alarm Panel indicates
+        -- a change of state.
+        --
+        -- The code in this Alarm interface may not have captured all of the Zone states.
+        -- Please validate within your own system to ensure it works in your cases.
+        --
+        function initializeZoneLabels(deviceId, childDevices)
+            ZONE_LABEL = {}
+
+            local zoneLabel
+            local zoneString
+            local zoneLabelRequest
+            local retryCount
+
+            luup.io.intercept()
+            for zone = 1, MAX_ALARM_ZONES do
+                zoneString = string.format("%03u", zone)
+                zoneLabelRequest = "ZL" .. zoneString
+
+                log("About to request " .. zoneLabelRequest)
+                if luup.io.write(zoneLabelRequest) == false then
+                    debug("Cannot send Request-Zone-Label, communications error - " .. zoneLabelRequest  .. " Check serial port")
+                    luup.set_failure(true)
+                    return false, "Cannot send Request-Zone-Label, communications error - " .. zoneLabelRequest, "ParadoxAlarmPanel"
+                end
+
+                retryCount = 1
+                repeat
+                    zoneLabel = luup.io.read()
+                    if (zoneLabel == nil) then
+                        debug("Failure in Request-Zone-Label Response, communications error " .. zoneLabelRequest)
+                        luup.set_failure(true)
+                        return false, "Failure in Request-Zone-Label Response, communications error " .. zoneLabelRequest, "ParadoxAlarmPanel"
+                    end
+
+                    -- Check to see if the data we got back aligns with the Command we
+                    -- just sent.  The Paradox Alarm panel will send back a response with
+                    -- the command "repeated" at the beginning.
+                    --
+                    if (string.find(zoneLabel, zoneLabelRequest, 1, true) ~= nil) then
+                        break
+                    else
+                        -- TODO: Make our standard handler handle these.
+                    end
+
+                    retryCount = retryCount + 1
+                until (retryCount &gt; MAX_RETRY)
+
+                --
+                -- If we hit a failure of this form when making Zone Label requests, it represents
+                -- that we've hit the end of the Zones for this Alarm Panel (since it may have 48, 96, or 192)
+                if (string.find(zoneLabel, "&amp;fail")) then
+                    debug("Request-Zone-Label Response, fail response " .. zoneLabelRequest .. "-" .. zoneLabel)
+                    return
+                end
+
+                --
+                -- Store it in the Global list of Zones
+                -- Index it using the "formatted" code so it's easier to find later on.  Note that the first "5"
+                -- characters of the zoneLabel are the same as the first 5 characters in the command
+                -- that were sent, and there are leading/trailing spaces, so we need to trim both.
+                --
+                zoneLabel = string.gsub(string.sub(zoneLabel, 6), "^%s*(.-)%s*$", "%1")
+
+                --
+                -- Only create MotionSensor devices for the Zone if we have a Label.
+                -- This will avoid cluttering Vera's UI with Devices that don't exist
+                -- as the Alarm Panel will enumerate all 48, 96 or 192 Zones regardless.
+                -- These come back with a label of "Zone n" or Blank (after spaces stripped)
+                --
+                if ((zoneLabel ~= "Zone " .. tostring(zone)) and (zoneLabel ~= "")) then
+                    zoneLabel = zoneLabel .. " (Zone " .. tostring(zone) .. ")"
+                    --zoneLabel = zoneLabel .. " (Zone " .. tostring(zone) .. ")"
+                    log("Storing " .. zoneString .. "-\"" .. zoneLabel .. "\"")
+
+                    luup.chdev.append(deviceId, childDevices,
+                        "Zone-" .. zoneString, zoneLabel,
+                        "urn:schemas-micasaverde-com:device:MotionSensor:1", "D_MotionSensor1.xml",
+                        "I_HorusParadoxSecurityEVO.xml", "", false)
+
+                    ZONE_LABEL[zoneString] = zoneLabel
+                else
+                    log("Skipping unused " .. zoneString .. "-\"" .. zoneLabel .. "\"")
+                end
+
+            end
+
+            return true, "Ok", "ParadoxAlarmPanel"
+        end
+
+
+        --- Initialize "Virtual PGM" Labels.
+        --
+        -- Each Virtual PGM is registered as a UPnP Motion Sensor Device.
+        --
+        -- These will be set to "Tripped" when the Alarm Panel tells us to do so, and will be
+        -- cleared when the Alarm Panel indicates a change of state.
+        --
+        -- The code in this Alarm interface may not have captured all of the Virtual PGM states.
+        -- Please validate within your own system to ensure it works in your cases.
+        --
+        function initializeVirtualLabels(deviceId, childDevices)
+            VIRTUAL_PGM_LABEL = {}
+
+            --
+            -- Setup default Virtual Program (Event) labels as these cannot be defined in the
+            -- Alarm system itself.
+            --
+            for i = 1, MAX_VIRTUAL_INPUTS do
+                local virtualPGMNumber = string.format("%03u", i)
+                VIRTUAL_PGM_LABEL[virtualPGMNumber] = "Virtual PGM Sensor " .. i
+                luup.chdev.append(deviceId, childDevices,
+                    "VirtualPGM-" .. virtualPGMNumber, "Virtual PGM Sensor " .. i,
+                    "urn:schemas-micasaverde-com:device:MotionSensor:1", "D_MotionSensor1.xml",
+                    "I_HorusParadoxSecurityEVO.xml", "", true)
+            end
+
+            return true, "Ok", "ParadoxAlarmPanel"
+        end
+
+
+        --- Initialize all of the Labels and Child Devices for the Alarm Panel functions.
+        --
+        -- This function initializes various internal data structures for the Alarm
+        -- Panel functions.  Where possible, it interrogates the Alarm panel itself
+        -- to find out the Capabilities.  In some cases, Paradox's API doesn't support
+        -- the interrogation, or doesn't report the "true" values back (not sure why)
+        --
+        -- Ultimately, this routine will register the following types of Devices in Vera.
+        --
+        --   For the Alarm controller/interface...
+        --     Alarm Communication
+        --
+        --   For each Alarm Area:
+        --     Alarm Area n
+        --
+        --   For each Zone
+        --     Zone n
+        --
+        --   For each Virtual Zone
+        --     Virtual PGM Sensor n
+        --
+        function initializeLabels(deviceId)
+            local state, message, stuff
+
+            KEYSWITCH_LABEL = {}
+            -- Setup default Keyswitch labels as we cannot extract them from the Alarm
+            for i = 1, 32 do
+                KEYSWITCH_LABEL[string.format("%03u", i)] = "Default Keyswitch Label " .. i
+            end
+
+            local childDevices = luup.chdev.start(deviceId)
+
+            luup.chdev.append(deviceId, childDevices,
+                "AlarmCommunication", "Alarm Communication",
+                "urn:schemas-micasaverde-com:device:MotionSensor:1", "D_MotionSensor1.xml",
+                "I_HorusParadoxSecurityEVO.xml", "", true)
+
+            state, message, stuff = initializeAreaLabels(deviceId, childDevices)
+            if (state) then
+                state, message, stuff = initializeZoneLabels(deviceId, childDevices)
+                if (state) then
+                    if (ENABLE_VIRTUAL_INPUTS) then
+                        state, message, stuff = initializeVirtualLabels(deviceId, childDevices)
+
+                        if (state == false) then
+                            return state, message, stuff
+                        end
+                    end
+
+                    state, message, stuff = initializeUserLabels(deviceId, childDevices)
+                end
+            end
+
+            if (state == false) then
+                return state, message, stuff
+            end
+
+            luup.chdev.sync(deviceId, childDevices)
+
+            DOOR_LABEL = {}
+            -- Setup default Door labels in case we're not able to retrieve them later.
+            for i = 1, 32 do
+                DOOR_LABEL[string.format("%03u", i)] = "Default Door Label " .. i
+            end
+
+            NON_REPORTABLE_EVENT_LABEL =
+               {["000"] = "TLM Trouble",
+                ["001"] = "Smoke detector reset",
+                ["002"] = "Arm with no entry delay",
+                ["003"] = "Arm with Stay mode",
+                ["004"] = "Arm in Away mode",
+                ["005"] = "Full arm when in Stay mode",
+                ["006"] = "Voice module access",
+                ["007"] = "Remote control access",
+                ["008"] = "PC Fail to communicate",
+                ["009"] = "Midnight",
+                ["010"] = "NEware User Login",
+                ["011"] = "NEware User Logout",
+                ["012"] = "User Initiated Callup",
+                ["013"] = "Force Answer",
+                ["014"] = "Force Hangup"
+               }
+
+            SPECIAL_ARMING_LABEL =
+               {["000"] = "Auto Arming",
+                ["001"] = "Arming by WinLoad",
+                ["002"] = "Late to Close",
+                ["003"] = "No Movement Arming",
+                ["004"] = "Partial Arming",
+                ["005"] = "One-touch Arming",
+                ["006"] = "Future Use",
+                ["007"] = "Future Use",
+                ["008"] = "(InTouch) Voice Module Arming"
+               }
+
+            SPECIAL_DISARM_EVENTS_LABEL =
+               {["000"] = "Auto Arm Cancelled",
+                ["001"] = "One-touch Stay/Instant Disarm",
+                ["002"] = "Disarming with WinLoad",
+                ["003"] = "Disarming with WinLoad after alarm",
+                ["004"] = "WinLoad cancelled alarm",
+                ["005"] = "Future Use",
+                ["006"] = "Future Use",
+                ["007"] = "Future Use",
+                ["008"] = "(InTouch) Voice Module Disarming"
+               }
+
+            SPECIAL_ALARM_LABEL =
+               {["000"] = "Emergency Panic (Keys 1 &amp; 3)",
+                ["001"] = "Medical Panic (Keys 4 &amp; 6)",
+                ["002"] = "Fire Panic (Keys 7 &amp; 9)",
+                ["003"] = "Recent Closing",
+                ["004"] = "Police Code",
+                ["005"] = "Global Shutdown"
+               }
+
+             TROUBLE_EVENT_LABEL =
+               {["000"] = "TLM Trouble",
+                ["001"] = "AC Failure",
+                ["002"] = "Battery Failure",
+                ["003"] = "Auxiliary Current Limit",
+                ["004"] = "Bell Current Limit",
+                ["005"] = "Bell Absent",
+                ["006"] = "Clock Trouble",
+                ["007"] = "Global Fire Loop"
+               }
+
+             MODULE_TROUBLE_LABEL =
+               {["000"] = "Combus Fault",
+                ["001"] = "Module Tamper",
+                ["002"] = "ROM/RAM error",
+                ["003"] = "TLM Trouble",
+                ["004"] = "Failure to Communicate",
+                ["005"] = "Printer Fault",
+                ["006"] = "AC Failure",
+                ["007"] = "Battery Failure",
+                ["008"] = "Auxiliary Failure"
+               }
+
+             SPECIAL_EVENTS_LABEL =
+               {["000"] = "Power up after total power down",
+                ["001"] = "Software reset (Watchdog)",
+                ["002"] = "Test Report",
+                ["003"] = "Future Use",
+                ["004"] = "WinLoad In (connected)",
+                ["005"] = "WinLoad Out (disconnected)",
+                ["006"] = "Installer in programming",
+                ["007"] = "Installer out of programming"
+               }
+
+             PARTITION_LABEL =
+               {["000"] = "Occurs in All Partitions",
+                ["001"] = "Partition 1",
+                ["002"] = "Partition 2",
+                ["003"] = "Partition 3",
+                ["004"] = "Partition 4",
+                ["005"] = "Partition 5",
+                ["006"] = "Partition 6",
+                ["007"] = "Partition 7",
+                ["008"] = "Partition 8",
+                ["255"] = "Occurs in at least one partition enabled in the system"
+                }
+
+             TELEPHONE_NUMBER_LABEL =
+               {["001"] = "Telephone Number 1",
+                ["002"] = "Telephone Number 2",
+                ["003"] = "Telephone Number 3",
+                ["004"] = "Telephone Number 4"
+               }
+
+             STATUS_1_LABEL =
+               {["000"] = "Armed",
+                ["001"] = "Force Armed",
+                ["002"] = "Stay Armed",
+                ["003"] = "Instant Armed",
+                ["004"] = "Strobe Alarm",
+                ["005"] = "Silent Alarm",
+                ["006"] = "Audible Alarm",
+                ["007"] = "Fire Alarm"
+               }
+
+             STATUS_2_LABEL =
+               {["000"] = "Ready",
+                ["001"] = "Exit Delay",
+                ["002"] = "Entry Delay",
+                ["003"] = "System in Trouble",
+                ["004"] = "Alarm in Memory",
+                ["005"] = "Zones Bypassed",
+                ["006"] = "Bypass, Master, Installer Programming",
+                ["007"] = "Keypad Lockout"
+               }
+
+             STATUS_3_LABEL =
+               {["000"] = "Intellizone Delay Engaged",
+                ["001"] = "Fire Delay Engaged",
+                ["002"] = "Auto Arm",
+                ["003"] = "Arming with Voice Module (set until Exit Delay finishes)",
+                ["004"] = "Tamper",
+                ["005"] = "Zone Low Battery",
+                ["006"] = "Fire Loop Trouble",
+                ["007"] = "Zone Supervision Trouble"
+               }
+
+            --
+            -- The field on the end is for a future codebase.
+            --
+            EVENT_GROUP =
+               {["000"] = {"Zone is OK", ZONE_LABEL, false},
+                ["001"] = {"Zone is Open", ZONE_LABEL, true},
+                ["002"] = {"Zone is Tampered", ZONE_LABEL, true},
+                ["003"] = {"Zone is in Fire Loop Trouble", ZONE_LABEL, true},
+                ["004"] = {"Non-reportable Event", NON_REPORTABLE_EVENT_LABEL},
+                ["005"] = {"User Code entered on Keypad", USER_LABEL},
+                ["006"] = {"User/Card Access on door", nil},
+                ["007"] = {"Bypass Programming Access", USER_LABEL},
+                ["008"] = {"TX Delay Zone Alarm", ZONE_LABEL, true},
+                ["009"] = {"Arming with Master", USER_LABEL, {arm=true, stay=false}},
+                ["010"] = {"Arming with User Code", USER_LABEL, {arm=true, stay=false}},
+                ["011"] = {"Arming with Keyswitch", KEYSWITCH_LABEL, {arm=true, stay=false}},
+                ["012"] = {"Special Arming", SPECIAL_ARMING_LABEL, nil},
+                ["013"] = {"Disarm with Master", USER_LABEL, {arm=false, stay=false}},
+                ["014"] = {"Disarm with User Code", USER_LABEL, {arm=false, stay=false}},
+                ["015"] = {"Disarm with Keyswitch", KEYSWITCH_LABEL, {arm=false, stay=false}},
+                ["016"] = {"Disarm after Alarm with Master", USER_LABEL, {arm=false, stay=false}},
+                ["017"] = {"Disarm after alarm with User Code", USER_LABEL, {arm=false, stay=false}},
+                ["018"] = {"Disarm after alarm with Keyswitch", KEYSWITCH_LABEL, {arm=false, stay=false}},
+                ["019"] = {"Alarm Cancelled with Master", USER_LABEL, {arm=false,stay=false}},
+                ["020"] = {"Alarm Cancelled with User Code", USER_LABEL, {arm=false, stay=false}},
+                ["021"] = {"Alarm Cancelled with Keyswitch", KEYSWITCH_LABEL, {arm=false, stay=false}},
+                ["022"] = {"Special Disarm Events", SPECIAL_DISARM_EVENTS_LABEL, nil},
+                ["023"] = {"Zone Bypassed", ZONE_LABEL, false},
+                ["024"] = {"Zone in Alarm", ZONE_LABEL, true},
+                ["025"] = {"Fire Alarm", ZONE_LABEL},
+                ["026"] = {"Zone Alarm Restore", ZONE_LABEL, false},
+                ["027"] = {"Fire Alarm Restore", ZONE_LABEL, false},
+                ["028"] = {"Early to Disarm by User", USER_LABEL, {arm=false, stay=false}},
+                ["029"] = {"Late to Disarm by User", USER_LABEL, {arm=false, stay=false}},
+                ["030"] = {"Special Alarm", SPECIAL_ALARM_LABEL, {alarm=true}},
+                ["031"] = {"Duress Alarm by User", USER_LABEL, {alarm=true}},
+                ["032"] = {"Zone Shutdown", ZONE_LABEL, false},
+                ["033"] = {"Zone Tamper", ZONE_LABEL, true},
+                ["034"] = {"Zone Tamper Restore", ZONE_LABEL, false},
+                ["035"] = {"Special Tamper", nil},
+                ["036"] = {"Trouble Event", TROUBLE_EVENT_LABEL},
+                ["037"] = {"Trouble Restore", TROUBLE_EVENT_LABEL},
+                ["038"] = {"Module Trouble", MODULE_TROUBLE_LABEL},
+                ["039"] = {"Module Trouble Restore", MODULE_TROUBLE_LABEL},
+                ["040"] = {"Fail to Communicate on telephone Number", TELEPHONE_NUMBER_LABEL},
+                ["041"] = {"Low Battery on Zone", ZONE_LABEL, false},
+                ["042"] = {"Zone Supervision Trouble", ZONE_LABEL, true},
+                ["043"] = {"Low Battery on Zone Restored", ZONE_LABEL, false},
+                ["044"] = {"Zone Supervision Trouble Restored", ZONE_LABEL, false},
+                ["045"] = {"Special Events", SPECIAL_EVENTS_LABEL},
+                ["046"] = {"Early to Arm by User", USER_LABEL, {arm=true, stay=false}},
+                ["047"] = {"Late to Arm by User", USER_LABEL, {arm=true, stay=false}},
+                ["048"] = {"Utility Key", nil},
+                ["049"] = {"Request for Exit", DOOR_LABEL},
+                ["050"] = {"Access Denied", DOOR_LABEL},
+                ["051"] = {"Door Left Open Alarm", DOOR_LABEL, {alarm=true}},
+                ["052"] = {"Door Forced Alarm", DOOR_LABEL, {alarm=true}},
+                ["053"] = {"Door Left Open Restore", DOOR_LABEL, {alarm=false}},
+                ["054"] = {"Door Forced Open Restore", DOOR_LABEL, {alarm=false}},
+                ["055"] = {"Intellizone Triggered", ZONE_LABEL, false},
+                ["056"] = {"Zone Excluded on Force Arming", ZONE_EVENT, false},
+                ["057"] = {"Zone Went Back to Arm Status", ZONE_EVENT, false},
+                ["058"] = {"New Module Assigned on Combus", nil},
+                ["059"] = {"Module Manually Removed From Combus", nil},
+                ["060"] = {"Future Use", nil},
+                ["061"] = {"Future Use", nil},
+                ["062"] = {"Access Granted to User", USER_LABEL},
+                ["063"] = {"Access Denied to User", USER_LABEL},
+                ["064"] = {"Status 1", STATUS_1_LABEL},
+                ["065"] = {"Status 2", STATUS_2_LABEL},
+                ["066"] = {"Status 3", STATUS_3_LABEL}
+               }
+
+            return true, "Ok", "ParadoxAlarmPanel"
+        end
+
+        --- Find the named Child device of [this] Alarm Panel.
+        --
+        -- This function will enumerate the Master/Global list of devices in Vera and
+        -- locate the "named" Child device.  It's used all over to locate the Children.
+        --
+        --   "Why haven't you checked the children"  :)
+        --
+        -- This would make an awfully handy convenience method on a Device object... hint, hint.
+        --
+        local function findChild(deviceId, label)
+            for k, v in pairs(luup.devices) do
+                if (v.device_num_parent == deviceId
+                    and v.id == label) then
+                    return k
+                end
+            end
+
+            -- Dump a copy of the Global Module list for debugging purposes.
+            log("findChild cannot find deviceId: " .. tostring(deviceId) .. " label: " .. label)
+            for k, v in pairs(luup.devices) do
+                  log("Device Number: " .. k ..
+                         " v.device_type: " .. tostring(v.device_type) ..
+                         " v.device_num_parent: " .. tostring(v.device_num_parent) ..
+                         " v.id: " .. tostring(v.id)
+                         )
+            end
+        end
+
+
+        --- Set a command string to the Alarm Panel (with Label for diagnostic logging)
+        --
+        local function sendCommand(commandRequest, label)
+            log("About to request " .. commandRequest)
+
+            if luup.io.write(commandRequest) == false then
+                debug("Cannot send " .. label .. ", communications error - "
+                         .. commandRequest)
+                luup.set_failure(true)
+                return false
+            end
+
+            return true
+        end
+
+
+        local function validatePIN(code)
+            if ((code == nil) or (code == "")) then
+                return false, "Empty PIN"
+            else
+                local tmp = code:match("^%d+$")
+                if (tmp == nil) then 
+                    return false, "PIN is not numeric"
+                end
+            end
+
+            return true, "Valid PIN"
+        end
+
+
+        --- Set the Alarm into Armed State (PINCode)
+        -- TODO: might change to a Force-Arm, since it works with Motion (etc)
+        --
+        local function requestAreaArm(areaLabel, PINCode)
+            if (ENABLE_REMOTE_ARM) then
+                local valid, msg = validatePIN(PINCode)
+                if (valid) then
+                    return sendCommand("AA" .. areaLabel .. "A" .. PINCode, "Area-Arm")
+                else
+                    task(msg, TASK_ERROR)
+                end
+            else
+                task("Remote Arm is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        local function requestAreaForce(areaLabel, PINCode)
+            if (ENABLE_REMOTE_ARM) then
+                local valid, msg = validatePIN(PINCode)
+                if (valid) then
+                    return sendCommand("AA" .. areaLabel .. "F" .. PINCode, "Area-Force")
+                else
+                    task(msg, TASK_ERROR)
+                end
+            else
+                task("Remote Arm is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        --- Set the Alarm into Armed State (No PINCode)
+        -- TODO: might change to a Force-Arm, since it works with Motion (etc)
+        --
+        local function requestAreaQuickArm(areaLabel)
+            if (ENABLE_REMOTE_ARM) then
+                return sendCommand("AQ" .. areaLabel .. "A", "Area-Quick-Arm")
+            else
+                task("Remote Arm is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        local function requestAreaQuickForce(areaLabel)
+            if (ENABLE_REMOTE_ARM) then
+                return sendCommand("AQ" .. areaLabel .. "F", "Area-Quick-Force")
+            else
+                task("Remote Arm is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        --- Set the Alarm into Stay State (PINCode)
+        --
+        local function requestAreaStay(areaLabel, PINCode)
+            if (ENABLE_REMOTE_ARM) then
+                local valid, msg = validatePIN(PINCode)
+                if (valid) then
+                    return sendCommand("AA" .. areaLabel .. "S" .. PINCode, "Area-Stay")
+                else
+                    task(msg, TASK_ERROR)
+                end
+            else
+                task("Remote Arm is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        local function requestAreaStayInstant(areaLabel, PINCode)
+            if (ENABLE_REMOTE_ARM) then
+                local valid, msg = validatePIN(PINCode)
+                if (valid) then
+                    return sendCommand("AA" .. areaLabel .. "I" .. PINCode, "Area-Instant")
+                else
+                    task(msg, TASK_ERROR)
+                end
+            else
+                task("Remote Arm is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        --- Set the Alarm into Stay State (No PINCode)
+        --
+        local function requestAreaQuickStay(areaLabel)
+            if (ENABLE_REMOTE_ARM) then
+                return sendCommand("AQ" .. areaLabel .. "S", "Area-Quick-Stay")
+            else
+                task("Remote Arm is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        local function requestAreaQuickStayInstant(areaLabel)
+            if (ENABLE_REMOTE_ARM) then
+                return sendCommand("AQ" .. areaLabel .. "I", "Area-Quick-Instant")
+            else
+                task("Remote Arm is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        --- Set the Alarm into Disarmed State (PINCode)
+        --
+        local function requestAreaDisarm(areaLabel, PINCode)
+            if (ENABLE_REMOTE_DISARM) then
+                local valid, msg = validatePIN(PINCode)
+                if (valid) then
+                    return sendCommand("AD" .. areaLabel .. PINCode, "Area-Disarm")
+                else
+                    task(msg, TASK_ERROR)
+                end
+            else
+                task("Remote Disarm is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        local function requestAreaQuickDisarm(areaLabel)
+            -- No Disarm without PINCode
+            task("No Disarm without PIN", TASK_ERROR)
+        end
+
+
+        local ARMING_FUNCTIONS =
+           {["Disarmed"]     = {requestAreaDisarm, requestAreaQuickDisarm},
+            ["Armed"]        = {requestAreaArm, requestAreaQuickArm},
+            ["ArmedInstant"] = {requestAreaArm, requestAreaQuickArm},
+            ["Stay"]         = {requestAreaStay, requestAreaQuickStay},
+            ["StayInstant"]  = {requestAreaStayInstant, requestAreaQuickStayInstant},
+            ["Night"]        = {requestAreaStay, requestAreaQuickStay},
+            ["NightInstant"] = {requestAreaStayInstant, requestAreaQuickStayInstant},
+            ["Force"]        = {requestAreaForce, requestAreaQuickForce},
+            ["Vacation"]     = {requestAreaArm, requestAreaQuickArm}
+           }
+
+
+        --- Set a Named-Virtual Input to a particular state
+        -- state == 0 (Open) / 1 (Closed)
+        --
+        local function setVirtualInput(areaLabel, input, state)
+            if (state == "1") then
+                return sendCommand("VC" .. string.format("%03u", input), "Set-Virtual-Input-Closed")
+            elseif (state == "0") then
+                return sendCommand("VO" .. string.format("%03u", input), "Set-Virtual-Input-Open")
+            else
+                assert(false, "setVirtualInput received a bad parameter (state=" .. state .. ")")
+            end
+        end
+
+
+        --- Set the Alarm into Medical Panic (No PINCode)
+        --
+        local function requestAreaMedicalPanic(areaLabel)
+            if (ENABLE_REMOTE_PANIC) then
+                return sendCommand("PM" .. areaLabel, "Area-Medical-Panic")
+            else
+                task("Remote Panic is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        --- Set the Alarm into Fire Panic (No PINCode)
+        --
+        local function requestAreaFirePanic(areaLabel)
+            if (ENABLE_REMOTE_PANIC) then
+                return sendCommand("PF" .. areaLabel, "Area-Fire-Panic")
+            else
+                task("Remote Panic is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        --- Set the Alarm into Police Panic (No PINCode)
+        --
+        local function requestAreaPolicePanic(areaLabel)
+            if (ENABLE_REMOTE_PANIC) then
+                return sendCommand("PE" .. areaLabel, "Area-Police-Panic")
+            else
+                task("Remote Panic is not enabled", TASK_ERROR)
+            end
+        end
+
+
+        local PANIC_FUNCTIONS =
+           {["Medical"] = requestAreaMedicalPanic,
+            ["Fire"]    = requestAreaFirePanic,
+            ["Police"]  = requestAreaPolicePanic
+           }
+
+
+        --- Set or Reset the Tripped state of a MotionSensor1 UPnP Device.
+        --
+        -- Largely self-explanatory, note Lua's interesting syntax for the Ternary
+        -- operation, handy-yet-strangely evil ;)
+        --
+        --   "Global Constants, order on Table 5"
+        --
+        local function sendSecuritySensorEvent(device, state)
+            local time = os.time(os.date('*t'))
+            local origTripped = luup.variable_get(SECURITY_SENSOR_SERVICEID, "Tripped", device)
+            origTripped = origTripped or "0"
+
+            luup.variable_set(SECURITY_SENSOR_SERVICEID, "Tripped", state and "1" or "0", device)
+            luup.variable_set(HADEVICE_SERVICEID, "LastUpdate", time, device)
+
+            if (state and (origTripped == "0")) then
+                luup.variable_set(SECURITY_SENSOR_SERVICEID, "LastTrip", time, device)
+            end
+        end
+
+        local function processArm(deviceId, area)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm Armed Device " .. area)
+                return
+            end
+
+            local estado_anterior_boton = luup.variable_get(ALARM_PARTITION_SERVICEID2, "EstadoBoton", areaDevice)
+            
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "Armed", "1", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "StayArmed", "0", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "Disarmed", "0", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "ArmMode", "Armed", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "DetailedArmMode", "Armed", areaDevice)
+            
+            if ( estado_anterior_boton ~= "Force") then
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "EstadoBoton", "Armed", areaDevice)
+            end
+            
+        end
+
+        local function processForce(deviceId, area)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm Force Device " .. area)
+                return
+            end
+
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "Armed", "1", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "StayArmed", "0", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "Disarmed", "0", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "ArmMode", "Armed", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "DetailedArmMode", "Force", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "EstadoBoton", "Force", areaDevice)
+        end
+
+        local function processExitDelay(deviceId, area)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm ExitDelay Device " .. area)
+                return
+            end
+
+            debug("Partition::Exit Delay in Progress, partition=" .. area)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "DetailedArmMode", "ExitDelay", areaDevice)
+        end
+
+        local function processEntryDelay(deviceId, area)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm EntryDelay Device " .. area)
+                return
+            end
+
+            debug("Partition::Entry Delay in Progress, partition=" .. area)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "DetailedArmMode", "EntryDelay", areaDevice)
+        end
+
+        local function processReady(deviceId, area)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm Ready Device " .. area)
+                return
+            end
+
+            debug("Partition::Ready, partition=" .. area)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "DetailedArmMode", "Ready", areaDevice)
+        end
+
+        local function processChime(deviceId, area)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm Chime Device " .. area)
+                return
+            end
+
+            --
+            -- Paradox Panels don't allow the intraspection of this setting so we set it
+            -- to "false" per the spec.
+            --
+            debug("Partition::Chime, partition=" .. area)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "Chime", "false", areaDevice)
+        end
+
+        local function processNotReady(deviceId, area)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm NotReady Device " .. area)
+                return
+            end
+
+            debug("Partition::Not Ready, partition=" .. area)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "DetailedArmMode", "NotReady", areaDevice)
+        end
+
+        local function processStay(deviceId, area)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm Stay Device " .. area)
+                return
+            end
+
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "Armed", "1", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "StayArmed", "1", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "Disarmed", "0", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "ArmMode", "Armed", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "DetailedArmMode", "Stay", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "EstadoBoton", "Stay", areaDevice)
+        end
+
+        local function processInstant(deviceId, area)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm Stay Device " .. area)
+                return
+            end
+
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "Armed", "1", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "StayArmed", "1", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "Disarmed", "0", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "ArmMode", "Armed", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "DetailedArmMode", "StayInstant", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "EstadoBoton", "Stay", areaDevice)
+        end
+
+        local function processAlarmMemory(deviceId, area, memory)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm Memory Device " .. area)
+                return
+            end
+
+            --
+            -- Note that this might reset the LastAlarmActive value if the Vera unit "boots"
+            -- and the AlarmMemory flag is set in the Paradox.  In this situation, the 
+            -- date here will be reset to the "boot" time of Vera.
+            --
+            if (memory) then
+                luup.variable_set(ALARM_PARTITION_SERVICEID2, "AlarmMemory", "true", areaDevice)
+                luup.variable_set(ALARM_PARTITION_SERVICEID2, "LastAlarmActive", os.time(), areaDevice)
+            else
+                luup.variable_set(ALARM_PARTITION_SERVICEID2, "AlarmMemory", "false", areaDevice)
+            end
+        end
+
+        local function processDisarm(deviceId, area)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm Arm/Stay Device " .. area)
+                return
+            end
+
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "Armed", "0", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "StayArmed", "0", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID, "Disarmed", "1", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "ArmMode", "Disarmed", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "DetailedArmMode", "Disarmed", areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "EstadoBoton", "Disarmed", areaDevice)
+
+            -- Clear any in-panel AlarmMemory for this area
+            processAlarmMemory(deviceId, area, false)
+        end
+
+        local function processAlarm(deviceId, area, breach)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm Breach Device " .. area)
+                return
+            end
+
+            if (breach) then
+                luup.variable_set(ALARM_PARTITION_SERVICEID, "Breach", "1", areaDevice)
+                luup.variable_set(ALARM_PARTITION_SERVICEID2, "Alarm", "Active", areaDevice)
+            else
+                luup.variable_set(ALARM_PARTITION_SERVICEID, "Breach", "0", areaDevice)
+                luup.variable_set(ALARM_PARTITION_SERVICEID2, "Alarm", "None", areaDevice)
+            end
+        end
+
+        local function processUser(deviceId, area, user)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm User Device " .. area)
+                return
+            end
+
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "LastUser", user, areaDevice)
+        end
+
+        local function processVendorInfo(deviceId, area, eventGroup, eventNumber, label)
+            local areaDevice = findChild(deviceId, "Area-" .. area)
+
+            -- The referenced device should be found in the list.
+            if (areaDevice == nil) then
+                log("Unable to locate Alarm Area Device " .. area)
+                return
+            end
+
+            --
+            -- Establish these for any custom events.  Set the Data, then Code, then Label (in order)
+            -- so that the data + code are available for Luup-based stuff if needed in the VendorStatus
+            -- change event.
+            --
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "VendorStatusData", eventNumber, areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "VendorStatusCode", eventGroup, areaDevice)
+            luup.variable_set(ALARM_PARTITION_SERVICEID2, "VendorStatus", label, areaDevice)
+        end
+
+        --- Set a Triggerable state on the Device if we have a Communications Failure.
+        --
+        -- This allows us to detect issues in the Alarm interface, or it's connectivity to Vera,
+        -- and respond accordingly.
+        --
+        local function processCommunicationEvent(deviceId, data)
+            local device = findChild(deviceId, "AlarmCommunication")
+            local comm = string.sub(data, 6)
+
+            if (device == nil) then
+                log("Unable to locate Alarm Communication Device ")
+                return
+            end
+
+            if (comm == "fail") then
+                sendSecuritySensorEvent(device, false)
+            elseif (comm == "ok") then
+                sendSecuritySensorEvent(device, true)
+            else
+                log("Unhandled Communications Event " .. data)
+            end
+        end
+
+        --- Set a Triggerable state on the Device if we have a Communications Buffer Failure
+        --
+        -- This allows us to detect issues in the Alarm interface, or connectivity to Vera,
+        -- and respond accordingly.
+        --
+        local function processCommunicationBufferEvent(deviceId, data)
+            local device = findChild(deviceId, "AlarmCommunication")
+
+            if (device == nil) then
+                log("Unable to locate Alarm Communication Device ")
+                return
+            end
+
+            --
+            -- TODO: Not sure how this is going to reset itself...
+            --
+            sendSecuritySensorEvent(device, true)
+        end
+
+        local function processZoneEvent(deviceId, zoneNumber, tripped)
+            local device = findChild(deviceId, "Zone-" .. zoneNumber)
+            -- The referenced device should be found in the list.
+            if (device == nil) then
+                log("Unable to locate Zone Device " .. zoneNumber)
+                return
+            end
+
+            sendSecuritySensorEvent(device, tripped)
+
+            return ZONE_LABEL[zoneNumber]
+        end
+
+        local function processGroupEvent(deviceId, data)
+
+            -- TODO: Apologize profusely for all the Magic constants used for String offsets.
+            local eventGroup = string.sub(data, 2, 4)
+            local eventNumber = string.sub(data, 6, 8)
+            local areaNumber = string.sub(data, 10, 12)
+            --
+            -- Validate the presence of the "N" in char-pos 5 and "A" in char-pos 9
+            -- to ensure it really is a System Event.
+            --
+            if (string.sub(data, 5, 5) == "N" and string.sub(data, 9, 9) == "A") then
+                local eventGroupLabel = EVENT_GROUP[eventGroup][1]
+                local tmp = EVENT_GROUP[eventGroup][2]
+                local eventLabel
+                local areaLabel
+
+                processVendorInfo(deviceId, areaNumber, eventGroup, eventNumber, eventGroupLabel)
+
+                if (tmp == ZONE_LABEL) then
+                    eventLabel = processZoneEvent(deviceId, eventNumber, EVENT_GROUP[eventGroup][3])
+                    areaLabel = AREA_LABEL[areaNumber]
+
+                    if     (eventGroup == "024" or
+                            eventGroup == "025") then
+                        processAlarm(deviceId, areaNumber, true)
+                    elseif (eventGroup == "026" or
+                            eventGroup == "027") then
+                        processAlarm(deviceId, areaNumber, false)
+                    end
+                elseif (tmp == USER_LABEL) then
+                    eventLabel = tmp[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+
+                    processUser(deviceId, areaNumber, USER_LABEL[eventNumber] or "Unknown")
+
+                    -- TODO: Move this logic into the last parameter of my Table
+                    --       and eliminate all this logic by making it table-driven.
+                    if     (eventGroup == "009" or
+                            eventGroup == "010" or
+                            eventGroup == "011" or
+                            eventGroup == "012" or
+                            eventGroup == "046" or
+                            eventGroup == "047") then
+                        processArm(deviceId, areaNumber)
+                    elseif (eventGroup == "013" or
+                            eventGroup == "014" or
+                            eventGroup == "015" or
+                            eventGroup == "016" or
+                            eventGroup == "017" or
+                            eventGroup == "018" or
+                            eventGroup == "019" or
+                            eventGroup == "020" or
+                            eventGroup == "021" or
+                            eventGroup == "022" or
+                            eventGroup == "028" or
+                            eventGroup == "029") then
+                        processDisarm(deviceId, areaNumber)
+                    elseif (eventGroup == "019" or
+                            eventGroup == "020") then
+                        processAlarm(deviceId, areaNumber, false)
+                    elseif (eventGroup == "031") then
+                        processAlarm(deviceId, areaNumber, true)
+                    end
+                elseif (tmp == DOOR_LABEL) then
+                    eventLabel = tmp[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+
+                    -- TODO: Move this logic into the last parameter of my Table
+                    --       and eliminate all this logic by making it table-driven.
+                    if (eventGroup == "051" or
+                        eventGroup == "052") then
+                        processAlarm(deviceId, areaNumber, true)
+                    elseif (eventGroup == "053" or
+                            eventGroup == "054") then
+                        processAlarm(deviceId, areaNumber, false)
+                    end
+                elseif (tmp == NON_REPORTABLE_EVENT_LABEL) then
+                    eventLabel = tmp[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+                elseif (tmp == KEYSWITCH_LABEL) then
+                    eventLabel = tmp[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+
+                    -- TODO: Move this logic into the last parameter of my Table
+                    --       and eliminate all this logic by making it table-driven.
+                    if (eventGroup == "011") then
+                        processArm(deviceId, areaNumber)
+                    elseif (eventGroup == "015" or
+                            eventGroup == "018") then
+                        processDisarm(deviceId, areaNumber)
+                    elseif (eventGroup == "021") then
+                        processAlarm(deviceId, areaNumber, false)
+                    end
+                elseif (tmp == SPECIAL_ARMING_LABEL) then
+                    eventLabel = tmp[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+
+                    -- TODO: Move this logic into the last parameter of my Table
+                    --       and eliminate all this logic by making it table-driven.
+                    if (eventNumber == "004") then
+                          -- These occur when you Force-Arm, but they also can occur when you StayArm
+                          -- so we dont need to trigger from these are there are better ones...
+                    elseif (eventNumber == "000" or
+                            eventNumber == "001" or
+                            eventNumber == "003" or
+                            eventNumber == "008") then
+                        processArm(deviceId, areaNumber)
+                    end
+                elseif (tmp == SPECIAL_EVENTS_LABEL) then
+                    eventLabel = tmp[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+
+                    -- TODO: Move this logic into the last parameter of my Table
+                    --       and eliminate all this logic by making it table-driven.
+                    if (eventNumber == "000" or eventNumber == "001") then
+                        -- TODO: Schedule a re-initialize of the startup values after a Power-up or Software Reset.
+                    elseif (eventNumber == "005" or
+                            eventNumber == "007") then
+                        -- TODO: Schedule a re-load of the Alarm structure after a WinLoad Out or Installer out of Programming
+                    end
+                elseif (tmp == SPECIAL_DISARM_EVENTS_LABEL) then
+                    eventLabel = tmp[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+
+                    if (eventNumber == "000" or
+                        eventNumber == "001" or
+                        eventNumber == "002" or
+                        eventNumber == "003" or
+                        eventNumber == "004" or
+                        eventNumber == "005" or
+                        eventNumber == "006" or
+                        eventNumber == "007" or
+                        eventNumber == "008") then
+                        processDisarm(deviceId, areaNumber)
+                    end
+                elseif (tmp == SPECIAL_ALARM_LABEL) then
+                    eventLabel = tmp[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+
+                    -- TODO: Move this logic into the last parameter of my Table
+                    --       and eliminate all this logic by making it table-driven.
+                    if (eventNumber == "000" or
+                        eventNumber == "001" or
+                        eventNumber == "002" or
+                        eventNumber == "003" or
+                        eventNumber == "004") then
+                        processAlarm(deviceId, areaNumber, true)
+                    end
+                elseif (tmp == TROUBLE_EVENT_LABEL) then
+                    eventLabel = tmp[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+                elseif (tmp == MODULE_TROUBLE_LABEL) then
+                    eventLabel = tmp[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+                    -- TODO: Handle 038 Trouble communications, set Communications error(true)
+                    -- TODO: Handle 039 Restore communications, reset Communications error(false)
+                elseif (tmp == TELEPHONE_NUMBER_LABEL) then
+                    eventLabel = tmp[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+                elseif (tmp == STATUS_1_LABEL) then
+                    eventLabel = STATUS_1_LABEL[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+                    --
+                    -- By processing codes 000/001 (Armed) and 002/003 (StayArmed) we effectively
+                    -- set the Alarm technically before it's alarmed.
+                    -- These appear to indicate that the Alarm cycle has been requested, but not quite
+                    -- an alarm state.  That comes via a separate message.
+                    --
+                    -- TODO: Set a flag indicating the requested state, and defer the actual "processAlarmXxxxx"
+                    --       until the terminal notification.
+                    -- TODO: Move all this logic into the last parameter of my Table
+                    --       and eliminate all this logic by making it table-driven.
+                    if     (eventNumber == "000") then
+                        processArm(deviceId, areaNumber)
+                    elseif (eventNumber == "001") then
+                        processForce(deviceId, areaNumber)
+                    elseif (eventNumber == "002") then
+                        processStay(deviceId, areaNumber)
+                    elseif (eventNumber == "003") then
+                        processInstant(deviceId, areaNumber)
+                    elseif (eventNumber == "004" or
+                            eventNumber == "005" or
+                            eventNumber == "006" or
+                            eventNumber == "007") then
+                        processAlarm(deviceId, areaNumber, true);
+                    end
+                elseif (tmp == STATUS_2_LABEL) then
+                    eventLabel = STATUS_2_LABEL[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+
+                    -- TODO: Move all this logic into the last parameter of my Table
+                    --       and eliminate all this logic by making it table-driven.
+                    if     (eventNumber == "000") then
+                        processDisarm(deviceId, areaNumber)
+                    elseif (eventNumber == "001") then
+                        processExitDelay(deviceId, areaNumber)
+                    elseif (eventNumber == "002") then
+                        processEntryDelay(deviceId, areaNumber)
+                    elseif (eventNumber == "004") then
+                        processAlarmMemory(deviceId, areaNumber, true)
+                    end
+                elseif (tmp == STATUS_3_LABEL) then
+                    eventLabel = STATUS_3_LABEL[eventNumber]
+                    areaLabel = AREA_LABEL[areaNumber]
+                else
+                    eventLabel = "No Event Label Defined"
+                    areaLabel = "No Area Label Defined"
+                end
+                debug(eventGroup .. ":" ..  eventGroupLabel
+                       .. ", " .. eventNumber .. ":" .. eventLabel
+                       .. ", " .. areaNumber .. ":" ..areaLabel)
+            end
+        end
+
+        local function processVirtualPGMEvent(deviceId, data)
+            local pgmNum = string.sub(data, 4, 5)
+            local pgmState = string.sub(data, 6)
+            local state
+
+            local device = findChild(deviceId, "VirtualPGM-" .. pgmNum)
+
+            -- Parameter validations. The referenced device should be found in the list.
+            if (device == nil) then
+                log("Unable to locate Virtual PGM Event " .. pgmNum)
+                return
+            end
+
+            -- Parameter validations. The PGM State field should be "ON" of "OFF"
+            if (pgmState == "ON") then
+                state = true
+            elseif (pgmState == "OFF") then
+                state = false
+            else
+                log("Unknown Virtual PGM Event:" .. pgmNum .. "-" .. pgmState)
+                return
+            end
+
+            -- Send the event
+            sendSecuritySensorEvent(device, state)
+        end
+
+        --- Initialize the current Alarm State from the Alarm panel.
+        --
+        -- Initialize the Alarm/Child Device states by retrieving values from the Alarm Panel
+        -- Done during Startup to ensure [Persisted] Device "Tripped" states are aligned with
+        -- the Alarm Panel.
+        --
+        function initializeAlarmState(deviceStr)
+            --
+            -- This logic is designed to determine the initial Alarm state at the time Vera
+            -- boots.  This may be different than the state it "thinks" each Zone (or the Alarm itself)
+            -- is in, so we have to perform a one-time poll.
+            --
+            local state, memory, alarm, ready
+            local statusRequest
+            local data
+            local device
+            local retryCount
+            local deviceId = tonumber(deviceStr)
+
+            luup.io.open()
+            luup.io.intercept()
+            for area in pairs(AREA_LABEL) do
+                -- Skip over Area 000 and Area 255, as these are "special" Areas within the Alarm Panel
+                -- and need to be ignored in this processing.
+                if (area ~= "000" and area ~= "255") then
+	                statusRequest = "RA" .. area
+
+	                log("About to request " .. statusRequest)
+
+	                if luup.io.write(statusRequest) == false then
+	                    debug("Cannot send Request-Area-Status, communications error - "
+	                        .. statusRequest)
+	                    luup.set_failure(true)
+	                    return false, "Cannot send Request-Area-Status, communications error", "ParadoxAlarmSystem"
+	                end
+
+	                retryCount = 1
+	                repeat
+	                    data = luup.io.read()
+	                    if (data == nil) then
+	                        debug("Failure in Request-Area-Status Response, communications error " .. statusRequest)
+	                        luup.set_failure(true)
+	                        return false, "Failure in Request-Area-Status Response, communications error", "ParadoxAlarmSystem"
+	                    end
+
+	                    -- Check to see if the data we got back aligns with the Command we
+	                    -- just sent.  The Paradox Alarm panel will send back a response with
+	                    -- the command "repeated" at the beginning.
+	                    --
+	                    if (string.find(data, statusRequest, 1, true) ~= nil) then
+	                        break
+	                    else
+	                        -- TODO: Make our standard handler handle these.
+	                    end
+
+	                    retryCount = retryCount + 1
+	                until (retryCount &gt; MAX_RETRY)
+
+	                if (string.find(data, "&amp;fail", 1, true) == nil) then
+	                    state = string.sub(data, 6, 6)
+                        memory = (string.sub(data, 7, 7) == "M")
+	                    ready = (string.sub(data, 9, 9) == "N")
+	                    alarm = (string.sub(data, 11, 11) == "A")
+
+	                    if (state == "A") then
+	                        processArm(deviceId, area)
+	                    elseif (state == "F") then
+	                        processForce(deviceId, area)
+	                    elseif (state == "S") then
+	                        processStay(deviceId, area)
+	                    elseif (state == "I") then
+	                        processInstant(deviceId, area)
+	                    elseif (state == "D") then
+	                        processDisarm(deviceId, area)
+	                    else
+	                        debug("Not implemented: Processing Area status (Armed)" .. data)
+	                    end
+
+	                    if (ready) then
+	                        processNotReady(deviceId, area)
+	                    else 
+	                        processReady(deviceId, area)
+	                    end
+
+                            processAlarm(deviceId, area, alarm)
+                            processAlarmMemory(deviceId, area, memory)
+                            processChime(deviceId, area)
+	                else
+	                    debug("Communications issue reading Area Status " .. data)
+	                end
+                end
+            end
+
+            for zone in pairs(ZONE_LABEL) do
+                statusRequest = "RZ" .. zone
+
+                log("About to request " .. statusRequest)
+
+                if luup.io.write(statusRequest) == false then
+                    debug("Cannot send Request-Zone-Status, communications error - "
+                        .. statusRequest)
+                    luup.set_failure(true)
+                    return false, "Cannot send Request-Zone-Status, communications error", "ParadoxAlarmSystem"
+                end
+
+                retryCount = 1
+                repeat
+                 data = luup.io.read()
+                 if (data == nil) then
+                     debug("Failure in Request-Zone-Status Response, communications error " .. statusRequest)
+                        luup.set_failure(true)
+                     return false, "Failure in Request-Zone-Status response, communications error", "ParadoxAlarmSystem"
+                 end
+
+                    -- Check to see if the data we got back aligns with the Command we
+                    -- just sent.  The Paradox Alarm panel will send back a response with
+                    -- the command "repeated" at the beginning.
+                    --
+                    if (string.find(data, statusRequest, 1, true) ~= nil) then
+                        break
+                    else
+                        -- TODO: Make our standard handler handle these.
+                    end
+
+                    retryCount = retryCount + 1
+                until (retryCount &gt; MAX_RETRY)
+
+                device = findChild(deviceId, "Zone-" .. zone)
+                if (device ~= nil and string.find(data, "&amp;fail", 1, true) == nil) then
+                    state = string.sub(data, 6, 6)
+
+                    if (state == "C") then
+                        sendSecuritySensorEvent(device, false)
+                    elseif (state == "O") then
+                        sendSecuritySensorEvent(device, true)
+                    else
+                        log("Not implemented: Processing Zone status " .. data)
+                    end
+                end
+            end
+
+            return true, "Ok", "ParadoxAlarmPanel"
+        end
+
+        function alarmStartup(lul_device)
+            log("Paradox EVO #" .. tostring(lul_device) .. " starting with id " .. luup.devices[lul_device].id)
+
+            local status, message, stuff = initializeParameters(lul_device)
+            if (status ~= true) then
+                return status, message, stuff
+            end
+
+            status, message, stuff = initializeLabels(lul_device)
+            if (status) then
+                luup.call_timer("initializeAlarmState", 1, "1", "", tostring(lul_device))
+            end
+
+            return status, message, stuff
+        end
+    </functions>
+    <incoming>
+        <lua>
+            local data = tostring(lul_data)
+            if (string.sub(data, 1, 1) == "G") then
+                processGroupEvent(lul_device, data)
+            elseif (string.sub(data, 1, 3) == "PGM") then
+                processVirtualPGMEvent(lul_device, data)
+            elseif (string.sub(data, 1, 2) == "AA") then
+                log("Combus Event Area-Arm Returned " .. data)
+                -- TODO Write a Fail handler...
+            elseif (string.sub(data, 1, 2) == "AD") then
+                log("Combus Event Area-Disarm Returned " .. data)
+                -- TODO Write a Fail handler...
+            elseif (string.sub(data, 1, 2) == "AQ") then
+                log("Combus Event Area-Quick-Arm Returned " .. data)
+                -- TODO Write a Fail handler...
+            elseif (string.sub(data, 1, 2) == "VC") then
+                log("Combus Event Virtual-Input-Close Returned " .. data)
+                -- TODO Write a Fail handler, esp since the Virtual Input may not be enabled in Paradox...
+            elseif (string.sub(data, 1, 2) == "VO") then
+                log("Combus Event Virtual-Input-Open Returned " .. data)
+                -- TODO Write a Fail handler, esp since the Virtual Input may not be enabled in Paradox...
+            elseif (string.sub(data, 1, 4) == "COMM") then
+                processCommunicationEvent(lul_device, data)
+            elseif (string.sub(data, 1, 1) == "!") then
+                processCommunicationBufferEvent(lul_device, data)
+            else
+                log("Unhandled Combus Event:" .. data)
+            end
+
+        </lua>
+    </incoming>
+    <startup>alarmStartup</startup>
+    <actionList>
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition1</serviceId>
+            <name>RequestArm</name>
+            <run>
+                log("RequestArm " .. lul_device .. " " .. luup.devices[lul_device].id)
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                requestAreaArm(areaLabel, lul_settings.PINCode)
+            </run>
+        </action>
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition1</serviceId>
+            <name>RequestQuickArm</name>
+            <run>
+                log("RequestQuickArm " .. lul_device .. " " .. luup.devices[lul_device].id)
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                requestAreaQuickArm(areaLabel)
+            </run>
+        </action>
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition1</serviceId>
+            <name>RequestStay</name>
+            <run>
+                log("RequestStay " .. lul_device .. " " .. luup.devices[lul_device].id)
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                requestAreaStay(areaLabel, lul_settings.PINCode)
+            </run>
+        </action>
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition1</serviceId>
+            <name>RequestQuickStay</name>
+            <run>
+                log("RequestQuickStay " .. lul_device .. " " .. luup.devices[lul_device].id)
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                requestAreaQuickStay(areaLabel)
+            </run>
+        </action>
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition1</serviceId>
+            <name>RequestDisarm</name>
+            <run>
+                log("RequestDisarm " .. lul_device .. " " .. luup.devices[lul_device].id)
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                requestAreaDisarm(areaLabel, lul_settings.PINCode)
+            </run>
+        </action>
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition1</serviceId>
+            <name>SetVirtualInput</name>
+            <run>
+                log("SetVirtualInput " .. lul_device .. " " .. luup.devices[lul_device].id)
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                setVirtualInput(areaLabel, lul_settings.Input, lul_settings.NewState)
+            </run>
+        </action>
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition1</serviceId>
+            <name>RequestMedicalPanic</name>
+            <run>
+                log("RequestMedicalPanic " .. lul_device .. " " .. luup.devices[lul_device].id)
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                requestAreaMedicalPanic(areaLabel)
+            </run>
+        </action>
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition1</serviceId>
+            <name>RequestFirePanic</name>
+            <run>
+                log("RequestFirePanic " .. lul_device .. " " .. luup.devices[lul_device].id)
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                requestAreaFirePanic(areaLabel)
+            </run>
+        </action>
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition1</serviceId>
+            <name>RequestPolicePanic</name>
+            <run>
+                log("RequestPolicePanic " .. lul_device .. " " .. luup.devices[lul_device].id)
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                requestAreaPolicePanic(areaLabel)
+            </run>
+        </action>
+
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:SecuritySensor1</serviceId>
+            <name>SetArmed</name>
+            <run>
+                local device = luup.devices[lul_device].id
+                local deviceName = luup.devices[lul_device].description
+
+                log("SetArmed " .. lul_device .. " " .. device .. ":" .. deviceName)
+                luup.variable_set(SECURITY_SENSOR_SERVICEID, "Armed",
+                                  lul_settings.newArmedValue, lul_device)
+            </run>
+        </action>
+
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:HaDevice1</serviceId>
+            <name>ToggleState</name>
+            <run>
+                debug("Action::ToggleState:" .. lul_device)
+
+                --
+                -- Only do this if the call came into a Zone device, otherwise
+                -- we'll have SecuritySensor1 values all over the place.
+                --
+                local label = luup.devices[lul_device].id
+                local zoneLabel = string.match(label, "^Zone%-%d+$")
+                if (zoneLabel ~= nil) then
+                    local state = luup.variable_get(SECURITY_SENSOR_SERVICEID, "Armed",
+                                                    lul_device)
+                    if (state == "1") then
+                        luup.variable_set(SECURITY_SENSOR_SERVICEID, "Armed", "0", lul_device)
+                    elseif ((state == "0") or (state == nil)) then
+                        luup.variable_set(SECURITY_SENSOR_SERVICEID, "Armed", "1", lul_device)
+                    else
+                        task("ToggleState found bad value in Armed State", TASK_ERROR)
+                    end
+                else
+                    task("ToggleState not implemented", TASK_ERROR)
+                end
+            </run>
+        </action>
+
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition2</serviceId>
+            <name>RequestArmMode</name>
+            <run>
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                local methods = ARMING_FUNCTIONS[lul_settings.State]
+
+                debug("Action::RequestArmMode " .. (lul_settings.State or "N/A"))
+
+                if (methods == nil) then
+                    task("RequestArmMode Invalid state requested " .. (lul_settings.State or "N/A"), TASK_ERROR)
+                else
+                    if ((lul_settings.PINCode or "") ~= "") then
+                        methods[1](areaLabel, lul_settings.PINCode)
+                    else
+                        methods[2](areaLabel)
+                    end
+                end
+            </run>
+        </action>
+
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition2</serviceId>
+            <name>RequestQuickArmMode</name>
+            <run>
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                local methods = ARMING_FUNCTIONS[lul_settings.State]
+
+                debug("Action::RequestQuickArmMode " .. (lul_settings.State or "N/A"))
+
+                if (methods == nil) then
+                    task("RequestQuickArmMode Invalid state requested " .. (lul_settings.State or "N/A"), TASK_ERROR)
+                else
+                    methods[2](areaLabel)
+                end
+            </run>
+        </action>
+
+        <action>
+            <serviceId>urn:micasaverde-com:serviceId:AlarmPartition2</serviceId>
+            <name>RequestPanicMode</name>
+            <run>
+                local areaLabel = string.gsub(luup.devices[lul_device].id, "Area%-(%d+)", "%1")
+                local method = PANIC_FUNCTIONS[lul_settings.State]
+
+                --
+                -- Use regular logging here so there's a record of the request made in the logs.
+                --
+                log("Action::RequestPanicMode " .. lul_device .. " " .. luup.devices[lul_device].id)
+
+                if (method == nil) then
+                    task("RequestPanicMode Invalid state requested " .. (lul_settings.State or "N/A"), TASK_ERROR)
+                else
+                    method(areaLabel)
+                end
+            </run>
+        </action>
+    </actionList>
+</implementation>
